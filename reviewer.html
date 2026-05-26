@@ -105,19 +105,54 @@
       gap: 4px;
     }
     .slot {
+      position: relative;
       padding: 8px 4px; border: 1px solid #e5e7eb; border-radius: 6px;
       background: #fff; color: #6b7280; font-size: 13px; font-family: inherit;
       text-align: center; cursor: pointer; transition: background 0.08s, color 0.08s, border-color 0.08s;
     }
     .slot:hover { border-color: #00cccc; }
+    /* Amber tint = at least one OTHER reviewer has painted this slot.
+       The badge in the corner shows how many. Encourages reviewers to
+       pile onto common times rather than paint in isolation. */
+    .slot.has-others {
+      background: #fef3c7; border-color: #fbbf24; color: #78350f;
+    }
     .slot.selected {
       background: #00cccc; color: #fff; border-color: #00cccc; font-weight: 500;
+    }
+    /* When the reviewer paints a slot that others have ALSO painted, the
+       teal "selected" state wins for the background — but the badge stays
+       visible so the reviewer can see the panel forming. */
+    .slot.selected.has-others {
+      background: #00cccc; color: #fff; border-color: #00cccc;
     }
     .slot.booked {
       background: #f3f4f6; color: #9ca3af; border-color: #e5e7eb;
       cursor: not-allowed; font-style: italic;
     }
     .slot.booked::after { content: " · booked"; font-size: 10px; }
+    .others-badge {
+      position: absolute; top: 2px; right: 3px;
+      pointer-events: none;
+      font-size: 9px; font-weight: 600; line-height: 1;
+      padding: 2px 5px; border-radius: 8px;
+      background: #f59e0b; color: #fff;
+    }
+
+    /* -------- Legend (shown above the grid) -------- */
+    .legend {
+      display: flex; flex-wrap: wrap; gap: 14px;
+      font-size: 12px; color: #6b7280; margin: 0 0 14px;
+    }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-swatch {
+      width: 14px; height: 14px; border-radius: 4px;
+      border: 1px solid transparent; display: inline-block;
+    }
+    .legend-swatch.open    { background: #fff; border-color: #e5e7eb; }
+    .legend-swatch.others  { background: #fef3c7; border-color: #fbbf24; }
+    .legend-swatch.mine    { background: #00cccc; border-color: #00cccc; }
+    .legend-swatch.booked  { background: #f3f4f6; border-color: #e5e7eb; }
 
     /* -------- Save bar -------- */
     .save-bar {
@@ -241,7 +276,13 @@
 
     <section class="card" id="grid-card" hidden>
       <h2 id="grid-card-title">Your availability</h2>
-      <p class="help">Click slots to mark when you're free. Click and drag to paint a block. Slots are 30 minutes. Times shown in <strong>Pacific Time</strong> — that's how candidates see them too.</p>
+      <p class="help">Click slots to mark when you're free. Click and drag to paint a block. Slots are 30 minutes. <strong>Amber slots</strong> are times other reviewers have already painted — piling onto those creates a panel a candidate can actually book. Hover a slot to see who else is in. Times shown in <strong>Pacific Time</strong>.</p>
+      <div class="legend">
+        <span class="legend-item"><span class="legend-swatch open"></span>Open — paint to mark yourself free</span>
+        <span class="legend-item"><span class="legend-swatch others"></span>Others painted this — join the panel</span>
+        <span class="legend-item"><span class="legend-swatch mine"></span>You painted this</span>
+        <span class="legend-item"><span class="legend-swatch booked"></span>Booked</span>
+      </div>
       <div class="status info" id="load-status" style="margin-bottom: 12px;"></div>
       <div id="grid"></div>
     </section>
@@ -370,6 +411,10 @@ let pendingReviewer  = null;             // { id, name } — held by the confirm
 let loadToken        = 0;
 const selectedSlots  = new Set();        // ISO start strings of currently-selected slots
 const bookedSlots    = new Set();        // ISO start strings that are already booked (locked)
+// othersBySlot is { startIso: [{id, name}, ...] } — every painted slot
+// in the system, used to show amber pile-on hints. Filtered against the
+// current reviewer at render time so "others" means "other than me."
+let othersBySlot     = {};
 
 /* =====================================================================
  * App init (runs after the gate is satisfied)
@@ -424,6 +469,7 @@ async function commitReviewerSelection() {
 
   selectedSlots.clear();
   bookedSlots.clear();
+  othersBySlot = {};
   loadToken++;
 
   // Swap UI: hide picker, show banner + grid + save bar
@@ -435,21 +481,49 @@ async function commitReviewerSelection() {
   document.getElementById('save-bar').hidden = false;
   document.getElementById('save-status').textContent = '';
 
-  setLoadStatus('Loading your saved times…', 'info');
+  setLoadStatus('Loading your saved times and seeing who else is free…', 'info');
   const myToken = loadToken;
-  await loadExistingAvailability(selectedReviewer.id, myToken);
+  // Fetch in parallel — both are independent reads of the Sheet, so
+  // running them concurrently halves the perceived load time.
+  await Promise.all([
+    loadExistingAvailability(selectedReviewer.id, myToken),
+    loadAvailabilityOverview(myToken),
+  ]);
   if (myToken !== loadToken) return; // a newer load superseded us
   renderGrid();
   updateCount();
-  setLoadStatus(selectedSlots.size > 0
+
+  // Build a friendly load summary: your slots + how much overlap exists.
+  const overlapCount = countOverlapWithOthers();
+  const mineMsg = selectedSlots.size > 0
     ? 'Loaded your ' + selectedSlots.size + ' previously-saved slot' + (selectedSlots.size === 1 ? '' : 's') + '.'
-    : 'Fresh slate — paint the times you\'re free.', 'info');
+    : 'Fresh slate — paint the times you\'re free.';
+  const overlapMsg = overlapCount > 0
+    ? ' ' + overlapCount + ' amber slot' + (overlapCount === 1 ? ' has' : 's have') + ' other reviewers already on them — those are panel candidates.'
+    : '';
+  setLoadStatus(mineMsg + overlapMsg, 'info');
+}
+
+/**
+ * Count of unique start times in othersBySlot where at least one reviewer
+ * OTHER than the current one has painted. Used in the load-status line
+ * to tell the reviewer "X amber slots exist — go pile on."
+ */
+function countOverlapWithOthers() {
+  if (!selectedReviewer) return 0;
+  let n = 0;
+  for (const startIso in othersBySlot) {
+    const others = (othersBySlot[startIso] || []).filter(r => r.id !== selectedReviewer.id);
+    if (others.length > 0) n++;
+  }
+  return n;
 }
 
 function resetToPicker() {
   selectedReviewer = null;
   selectedSlots.clear();
   bookedSlots.clear();
+  othersBySlot = {};
   loadToken++;
   document.getElementById('identity-banner').hidden = true;
   document.getElementById('grid-card').hidden = true;
@@ -476,6 +550,28 @@ async function loadExistingAvailability(reviewerId, myToken) {
   } catch (err) {
     if (myToken !== loadToken) return;
     setLoadStatus('Could not load existing times: ' + err.message, 'error');
+  }
+}
+
+/**
+ * Fetch the cross-reviewer painted-slots overview. Non-fatal on failure
+ * — if this fetch errors out, we still render the grid, just without the
+ * amber "others are here" hints. That degrades to the pre-change UX
+ * rather than breaking the page.
+ */
+async function loadAvailabilityOverview(myToken) {
+  if (CONFIG.APPS_SCRIPT_URL.startsWith('REPLACE_ME')) return;
+  try {
+    const res = await fetch(CONFIG.APPS_SCRIPT_URL + '?action=availability_overview');
+    const data = await res.json();
+    if (myToken !== loadToken) return;
+    if (!data.ok) return;
+    othersBySlot = data.by_slot || {};
+  } catch (err) {
+    if (myToken !== loadToken) return;
+    othersBySlot = {};
+    // Intentionally silent — the page still works without overlap hints.
+    console.warn('availability_overview fetch failed:', err);
   }
 }
 
@@ -545,6 +641,21 @@ function makeSlotCell(slot) {
   btn.textContent = formatPTTime(slot.start);
   if (selectedSlots.has(slot.start)) btn.classList.add('selected');
   if (bookedSlots.has(slot.start))   btn.classList.add('booked');
+
+  // Decorate with "others are here" if at least one reviewer OTHER than
+  // the current viewer has painted this slot. The badge in the corner
+  // shows the count; the native tooltip shows the names.
+  const othersHere = (othersBySlot[slot.start] || [])
+    .filter(r => !selectedReviewer || r.id !== selectedReviewer.id);
+  if (othersHere.length > 0) {
+    btn.classList.add('has-others');
+    const badge = document.createElement('span');
+    badge.className = 'others-badge';
+    badge.textContent = '+' + othersHere.length;
+    btn.appendChild(badge);
+    btn.title = othersHere.map(r => r.name).join(', ') + ' also free at this time';
+  }
+
   btn.addEventListener('click', () => {
     if (bookedSlots.has(slot.start)) return;
     if (selectedSlots.has(slot.start)) selectedSlots.delete(slot.start);

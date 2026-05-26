@@ -92,6 +92,13 @@ const NOTIFY_EMAIL = "matt@dwellpeninsula.com";
  *   ?action=reviewers                  → list of {id, name}
  *   ?action=availability&reviewer=ID   → that reviewer's painted slots
  *                                        (used by reviewer.html for re-edit)
+ *   ?action=availability_overview      → every painted slot, grouped by
+ *                                        start_iso → list of [{id, name}].
+ *                                        Used by reviewer.html to show
+ *                                        which slots other reviewers have
+ *                                        painted (so the team can converge
+ *                                        on overlap instead of painting
+ *                                        blindly).
  *   ?action=panel_slots                → all future slots where at least
  *                                        MIN_PANEL_SIZE reviewers are free,
  *                                        with the list of who's available.
@@ -103,10 +110,11 @@ const NOTIFY_EMAIL = "matt@dwellpeninsula.com";
 function doGet(e) {
   try {
     const p = (e && e.parameter) || {};
-    if (p.action === "ping")          return jsonResponse({ ok: true, msg: "video scheduler alive" });
-    if (p.action === "reviewers")     return jsonResponse({ ok: true, reviewers: listReviewers() });
-    if (p.action === "availability")  return jsonResponse({ ok: true, slots: getReviewerPaintedSlots(p.reviewer) });
-    if (p.action === "panel_slots")   return jsonResponse({ ok: true, slots: getPanelSlots() });
+    if (p.action === "ping")                  return jsonResponse({ ok: true, msg: "video scheduler alive" });
+    if (p.action === "reviewers")             return jsonResponse({ ok: true, reviewers: listReviewers() });
+    if (p.action === "availability")          return jsonResponse({ ok: true, slots: getReviewerPaintedSlots(p.reviewer) });
+    if (p.action === "availability_overview") return jsonResponse({ ok: true, by_slot: getAvailabilityOverview() });
+    if (p.action === "panel_slots")           return jsonResponse({ ok: true, slots: getPanelSlots() });
     if (p.action === "audit") {
       if (p.password !== REVIEWER_PASSWORD) return jsonResponse({ ok: false, error: "bad password" });
       return jsonResponse({ ok: true, audit: auditAvailability() });
@@ -233,6 +241,52 @@ function getPanelSlots() {
   });
 
   return slots.sort((a, b) => new Date(a.start) - new Date(b.start));
+}
+
+/**
+ * Returns every painted (future) slot in the Availability tab, grouped by
+ * start_iso, with the list of reviewers who painted it. Used by
+ * reviewer.html to show which slots other reviewers have already marked
+ * as available — so reviewers can deliberately pile onto common times
+ * instead of painting blindly.
+ *
+ * Return shape:
+ *   {
+ *     "2026-05-27T15:00:00.000Z": [
+ *       { id: "brian-wo",       name: "Brian Wo" },
+ *       { id: "stacie-ciraulo", name: "Stacie Ciraulo" }
+ *     ],
+ *     ...
+ *   }
+ *
+ * Past slots and orphan reviewer_ids are filtered out. Booked slots ARE
+ * still included — the reviewer page uses its own booked-set to render
+ * those as locked anyway, but seeing "this was a panel slot, now claimed"
+ * is informative for the reviewer's mental model.
+ */
+function getAvailabilityOverview() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const availSheet = ss.getSheetByName("Availability");
+  const availData = availSheet.getDataRange().getValues();
+  availData.shift(); // drop header
+
+  const nowMs = Date.now();
+  const bySlot = {};
+  availData.forEach(r => {
+    if (!r[0] || !r[1] || !r[2]) return;
+    if (!REVIEWERS[r[0]]) return; // skip orphans
+    const startIso = toIso(r[1]);
+    if (new Date(startIso).getTime() < nowMs) return; // skip past
+    if (!bySlot[startIso]) bySlot[startIso] = [];
+    bySlot[startIso].push({ id: r[0], name: REVIEWERS[r[0]].name });
+  });
+
+  // Sort each bucket alphabetically so the frontend tooltip is stable.
+  Object.keys(bySlot).forEach(k => {
+    bySlot[k].sort((a, b) => a.name.localeCompare(b.name));
+  });
+
+  return bySlot;
 }
 
 /**
